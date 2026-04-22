@@ -51,6 +51,13 @@ class CotExample:
     assistant_text: str
 
 
+@dataclass(frozen=True, slots=True)
+class TaskStrategy:
+    goal: str
+    stable_trace_focus: list[str]
+    sft_note: str
+
+
 def clean_answer_text(answer: str) -> str:
     """Normalize an answer string from CSV inputs."""
 
@@ -141,6 +148,18 @@ def classify_task(prompt: str) -> str:
         and special_count > alpha_num_count * 0.15
     ):
         return "symbolic_transform"
+
+    equation_like_lines = [line for line in lines if "=" in line]
+    numeric_equation_lines = [
+        line
+        for line in equation_like_lines
+        if any(ch.isdigit() for ch in line.split("=", maxsplit=1)[0])
+    ]
+    if (
+        ("transformation rules" in lowered or "determine the result for" in lowered)
+        and len(numeric_equation_lines) >= 2
+    ):
+        return "equation"
 
     if (
         "roman numeral" in lowered
@@ -278,6 +297,91 @@ def classify_task(prompt: str) -> str:
         return "cryptarithm"
 
     return "other"
+
+
+TASK_STRATEGIES: dict[str, TaskStrategy] = {
+    "symbolic_transform": TaskStrategy(
+        goal="Infer a deterministic local symbol rewrite rule from the examples.",
+        stable_trace_focus=[
+            "Read input-output examples first.",
+            "Describe the symbol rewrite rule in fixed wording.",
+            "Apply the rule left-to-right to the query string.",
+        ],
+        sft_note="Keep the trace short and mechanical so the model learns the rule, not stylistic variation.",
+    ),
+    "numeral": TaskStrategy(
+        goal="Convert between Roman-like numerals and integers with a fixed scan procedure.",
+        stable_trace_focus=[
+            "Extract the numeral or integer from the prompt.",
+            "Use the same add/subtract scan logic every time.",
+            "State only the final converted value.",
+        ],
+        sft_note="Prefer one canonical conversion explanation to avoid format drift.",
+    ),
+    "unit_conversion": TaskStrategy(
+        goal="Apply unit factors step by step while keeping units explicit.",
+        stable_trace_focus=[
+            "Identify source quantity and target unit.",
+            "Select the conversion factor explicitly.",
+            "Apply one arithmetic chain and finish.",
+        ],
+        sft_note="This category benefits from highly repeatable arithmetic phrasing.",
+    ),
+    "gravity": TaskStrategy(
+        goal="Use the requested physical relation or planet multiplier in a fixed formula flow.",
+        stable_trace_focus=[
+            "Read the given mass/weight or constant.",
+            "Substitute into the required formula.",
+            "Compute once and report the result with units when needed.",
+        ],
+        sft_note="Avoid extra physics commentary; keep the derivation formula-first.",
+    ),
+    "cipher": TaskStrategy(
+        goal="Recover a consistent character or token mapping from examples, then decode left-to-right.",
+        stable_trace_focus=[
+            "Build the mapping from examples.",
+            "Preserve spaces and punctuation.",
+            "Decode in one deterministic pass.",
+        ],
+        sft_note="The trace should emphasize exact mapping reconstruction, not creative interpretation.",
+    ),
+    "bit_manipulation": TaskStrategy(
+        goal="Infer a deterministic bit rule from examples and apply it per output position.",
+        stable_trace_focus=[
+            "Inspect example input-output bit patterns.",
+            "Reason about output bits position by position.",
+            "Apply the same bit rule to the query input.",
+        ],
+        sft_note="This is the main score differentiator, so trace wording should stay extremely stable.",
+    ),
+    "equation": TaskStrategy(
+        goal="Infer the algebraic or arithmetic transformation pattern used by the examples.",
+        stable_trace_focus=[
+            "Read examples before touching the query.",
+            "Identify the repeated operation order.",
+            "Apply the same operation chain to the query.",
+        ],
+        sft_note="Use a single canonical explanation for the inferred arithmetic pattern.",
+    ),
+    "cryptarithm": TaskStrategy(
+        goal="Use a fixed assignment or column-consistency story instead of open-ended reasoning.",
+        stable_trace_focus=[
+            "Read the symbolic arithmetic examples carefully.",
+            "Infer the consistent assignment pattern.",
+            "Apply that pattern once to the query expression.",
+        ],
+        sft_note="Coverage is usually lower here, so keep traces conservative and deterministic.",
+    ),
+    "other": TaskStrategy(
+        goal="Fallback deterministic reasoning when the prompt does not match a known bucket.",
+        stable_trace_focus=[
+            "State the detected category.",
+            "Use a short deterministic procedure.",
+            "Return the final value without extra variation.",
+        ],
+        sft_note="Fallback traces should be rare and stable.",
+    ),
+}
 
 
 def build_symbolic_transform_trace(example: CompetitionExample) -> str:
@@ -624,6 +728,80 @@ def write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def count_rows_by_task(rows: list[CompetitionExample]) -> dict[str, int]:
+    """Count examples by task type in a stable key order."""
+
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row.task_type] = counts.get(row.task_type, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def count_records_by_task(records: list[dict[str, object]]) -> dict[str, int]:
+    """Count prepared records by task type."""
+
+    counts: dict[str, int] = {}
+    for record in records:
+        task_type = str(record["task_type"])
+        counts[task_type] = counts.get(task_type, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def write_trace_preview(path: Path, rows: list[CompetitionExample]) -> None:
+    """Write one sample trace preview per task bucket."""
+
+    samples: dict[str, CompetitionExample] = {}
+    for row in rows:
+        samples.setdefault(row.task_type, row)
+
+    lines = [
+        "# Trace Preview",
+        "",
+        "This file shows one deterministic trace template per detected task type.",
+        "",
+    ]
+
+    for task_type in sorted(samples):
+        sample = samples[task_type]
+        strategy = TASK_STRATEGIES.get(task_type, TASK_STRATEGIES["other"])
+        trace = build_trace(sample)
+        lines.extend(
+            [
+                f"## {task_type}",
+                "",
+                f"- Goal: {strategy.goal}",
+                f"- SFT note: {strategy.sft_note}",
+                "- Stable trace focus:",
+            ]
+        )
+        lines.extend(f"  - {item}" for item in strategy.stable_trace_focus)
+        lines.extend(
+            [
+                "",
+                "### Prompt",
+                "",
+                "```text",
+                sample.prompt,
+                "```",
+                "",
+                "### Answer",
+                "",
+                "```text",
+                clean_answer_text(sample.answer),
+                "```",
+                "",
+                "### Trace",
+                "",
+                "```text",
+                trace,
+                "```",
+                "",
+            ]
+        )
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def prepare_datasets(args: argparse.Namespace) -> tuple[Path, Path]:
     """Prepare train and validation JSONL files for Tinker SFT."""
 
@@ -685,9 +863,31 @@ def prepare_datasets(args: argparse.Namespace) -> tuple[Path, Path]:
     train_jsonl = output_dir / "train_sft.jsonl"
     val_jsonl = output_dir / "val_sft.jsonl"
     summary_json = output_dir / "dataset_summary.json"
+    strategy_json = output_dir / "task_strategy_report.json"
+    trace_preview = output_dir / "trace_preview.md"
 
     write_jsonl(train_jsonl, train_records)
     write_jsonl(val_jsonl, val_records)
+
+    strategy_report = {
+        "strategy": "classify_divide_trace_sft",
+        "task_counts": {
+            "raw": count_rows_by_task(competition_rows),
+            "train_split": count_rows_by_task(train_part),
+            "validation": count_rows_by_task(val_part),
+            "balanced_train": count_rows_by_task(train_balanced),
+            "final_train": count_records_by_task(train_records),
+        },
+        "task_strategies": {
+            task_type: {
+                "goal": strategy.goal,
+                "stable_trace_focus": strategy.stable_trace_focus,
+                "sft_note": strategy.sft_note,
+            }
+            for task_type, strategy in sorted(TASK_STRATEGIES.items())
+        },
+    }
+
     summary_json.write_text(
         json.dumps(
             {
@@ -697,16 +897,21 @@ def prepare_datasets(args: argparse.Namespace) -> tuple[Path, Path]:
                 "validation_count": len(val_part),
                 "optional_cot_count": len(optional_cot_rows),
                 "final_train_count": len(train_records),
+                "task_counts": strategy_report["task_counts"],
             },
             indent=2,
         )
         + "\n",
         encoding="utf-8",
     )
+    strategy_json.write_text(json.dumps(strategy_report, indent=2) + "\n", encoding="utf-8")
+    write_trace_preview(trace_preview, competition_rows)
 
     LOGGER.info("Prepared %s", train_jsonl)
     LOGGER.info("Prepared %s", val_jsonl)
     LOGGER.info("Prepared %s", summary_json)
+    LOGGER.info("Prepared %s", strategy_json)
+    LOGGER.info("Prepared %s", trace_preview)
     return train_jsonl, val_jsonl
 
 

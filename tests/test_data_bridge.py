@@ -33,6 +33,19 @@ def test_classify_task_detects_common_buckets() -> None:
     assert classify_task("Convert Roman numeral XIV into an integer.") == "numeral"
 
 
+def test_classify_task_detects_equation_bucket_from_numeric_operator_examples() -> None:
+    prompt = (
+        "In Alice's Wonderland, a secret set of transformation rules is applied to equations. "
+        "Below are a few examples:\n"
+        "34/44 = 1\n"
+        "41/32 = 9\n"
+        "34|25 = 69\n"
+        "87\\64 = 8853\n"
+        "Now, determine the result for: 69/52"
+    )
+    assert classify_task(prompt) == "equation"
+
+
 def test_classify_task_avoids_cipher_false_positive_from_embedded_substrings() -> None:
     prompt = (
         "In Alice's Wonderland, secret encryption rules are used on text. Here are some examples:\n"
@@ -140,13 +153,23 @@ def test_prepare_datasets_writes_jsonl_and_summary(tmp_path: Path) -> None:
 
     train_jsonl, val_jsonl = prepare_datasets(args)
     summary_path = Path(args.output_dir) / "dataset_summary.json"
+    strategy_path = Path(args.output_dir) / "task_strategy_report.json"
+    trace_preview_path = Path(args.output_dir) / "trace_preview.md"
 
     train_lines = train_jsonl.read_text(encoding="utf-8").strip().splitlines()
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    strategy = json.loads(strategy_path.read_text(encoding="utf-8"))
+    trace_preview = trace_preview_path.read_text(encoding="utf-8")
 
     assert train_lines
     assert val_jsonl.exists()
+    assert strategy_path.exists()
+    assert trace_preview_path.exists()
     first_record = json.loads(train_lines[0])
     assert "messages" in first_record
     assert first_record["messages"][0]["role"] == "system"
     assert summary["raw_train_count"] == 10
+    assert summary["task_counts"]["raw"]["bit_manipulation"] == 2
+    assert strategy["strategy"] == "classify_divide_trace_sft"
+    assert "bit_manipulation" in strategy["task_strategies"]
+    assert "## bit_manipulation" in trace_preview

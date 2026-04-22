@@ -15,6 +15,8 @@ Nemotron SSH training and Kaggle-compatible submission workflow for the NVIDIA N
   - converts the original Kaggle notebook into the improved notebook version
 - `scripts/sync_repo_to_hpc.py`
   - uploads this repo to the HFUT SSH machine over SFTP
+- `docs/classify_divide_trace_sft.md`
+  - task-by-task notes for the chosen classify-divide + stable trace + SFT approach
 - `slurm/train_nemotron_sft.sbatch`
   - Slurm training body
 - `slurm/submit_train.sh`
@@ -61,6 +63,8 @@ This writes:
 - `train_sft.jsonl`
 - `val_sft.jsonl`
 - `dataset_summary.json`
+- `task_strategy_report.json`
+- `trace_preview.md`
 
 ### 2. Run Kaggle-style LoRA training
 
