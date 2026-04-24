@@ -4,6 +4,109 @@ import argparse
 import json
 import pathlib
 import textwrap
+from pprint import pformat
+
+
+VARIANT_PRESETS: dict[str, dict[str, object]] = {
+    "baseline_hc": {
+        "title": "Tong Baseline HC",
+        "note": "Baseline Tong continuation with the current small high-confidence solved subset.",
+        "sft_max_len": 4096,
+        "sft_epochs": 2,
+        "sft_grad_accum": 16,
+        "sft_lr": "2e-5",
+        "small_subtype_overrides": {},
+        "tong_style_overrides": {},
+        "priority_duplication_factor_small": 1,
+    },
+    "bit_eq_boost": {
+        "title": "Tong BitEq Boost",
+        "note": "Boost high-confidence bit-manipulation and equation subtypes while keeping Tong continuation.",
+        "sft_max_len": 4096,
+        "sft_epochs": 2,
+        "sft_grad_accum": 16,
+        "sft_lr": "2e-5",
+        "small_subtype_overrides": {
+            ("bit_manipulation", "pairwise_parity_conjunctive_mix"): 96,
+            ("bit_manipulation", "pairwise_conjunctive_family"): 64,
+            ("bit_manipulation", "pairwise_disjunctive_family"): 64,
+            ("equation", "digitwise_compose"): 64,
+            ("equation", "query_filtered_whole_number_evaluate"): 32,
+            ("equation", "query_filtered_scalar_reduce"): 32,
+            ("equation", "query_filtered_digitwise_compose"): 32,
+        },
+        "tong_style_overrides": {
+            "bit_manipulation_including_wrong.csv": 192,
+            "bit_manipulation_synth_including_wrong_v2.csv": 96,
+            "equation_numeric.csv": 144,
+        },
+        "priority_duplication_factor_small": 1,
+    },
+    "ultra_low_drift": {
+        "title": "Tong Ultra Low Drift",
+        "note": "More conservative continuation with lower learning rate and fewer epochs to preserve Tong behavior.",
+        "sft_max_len": 4096,
+        "sft_epochs": 1,
+        "sft_grad_accum": 16,
+        "sft_lr": "1e-5",
+        "small_subtype_overrides": {
+            ("bit_manipulation", "pairwise_parity_conjunctive_mix"): 48,
+            ("equation", "digitwise_compose"): 32,
+        },
+        "tong_style_overrides": {
+            "bit_manipulation_including_wrong.csv": 96,
+            "equation_numeric.csv": 80,
+        },
+        "priority_duplication_factor_small": 1,
+    },
+    "priority_weighted": {
+        "title": "Tong Priority Weighted",
+        "note": "Keep the solved subset small, but duplicate Tong priority rows even in small mode.",
+        "sft_max_len": 4096,
+        "sft_epochs": 2,
+        "sft_grad_accum": 16,
+        "sft_lr": "2e-5",
+        "small_subtype_overrides": {},
+        "tong_style_overrides": {
+            "bit_manipulation_including_wrong.csv": 160,
+            "equation_numeric.csv": 128,
+        },
+        "priority_duplication_factor_small": 2,
+    },
+    "query_focus": {
+        "title": "Tong Query Focus",
+        "note": "Bias continuation toward query-operator-filtered equation rules and local boolean mixes.",
+        "sft_max_len": 4096,
+        "sft_epochs": 2,
+        "sft_grad_accum": 16,
+        "sft_lr": "2e-5",
+        "small_subtype_overrides": {
+            ("bit_manipulation", "pairwise_parity_conjunctive_mix"): 96,
+            ("equation", "query_filtered_whole_number_evaluate"): 48,
+            ("equation", "query_filtered_scalar_reduce"): 48,
+            ("equation", "query_filtered_digitwise_compose"): 48,
+        },
+        "tong_style_overrides": {
+            "bit_manipulation_including_wrong.csv": 176,
+            "equation_numeric.csv": 160,
+        },
+        "priority_duplication_factor_small": 1,
+    },
+    "cryptarithm_probe": {
+        "title": "Tong Cryptarithm Probe",
+        "note": "Add a tiny cryptarithm slice on top of the low-drift Tong continuation to test headroom.",
+        "sft_max_len": 4096,
+        "sft_epochs": 1,
+        "sft_grad_accum": 16,
+        "sft_lr": "1.5e-5",
+        "small_subtype_overrides": {},
+        "tong_style_overrides": {
+            "equation_numeric.csv": 112,
+            "cryptarithm.csv": 24,
+        },
+        "priority_duplication_factor_small": 1,
+    },
+}
 
 
 def to_source(text: str) -> list[str]:
@@ -15,6 +118,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rewrite the original Kaggle notebook into the improved version.")
     parser.add_argument("--src", required=True, help="Source ipynb path.")
     parser.add_argument("--dst", required=True, help="Destination ipynb path.")
+    parser.add_argument(
+        "--variant",
+        choices=sorted(VARIANT_PRESETS),
+        default="baseline_hc",
+        help="Experiment preset to bake into the generated notebook.",
+    )
     return parser.parse_args()
 
 
@@ -22,6 +131,8 @@ def main() -> None:
     args = parse_args()
     src = pathlib.Path(args.src).expanduser().resolve()
     dst = pathlib.Path(args.dst).expanduser().resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    variant = VARIANT_PRESETS[args.variant]
 
     nb = json.loads(src.read_text(encoding="utf-8"))
 
@@ -30,10 +141,39 @@ def main() -> None:
 
     set_source(
         0,
-        """
+        f"""
         ## 1. Offline Package Installation
 
-        > Improved continuation notebook: longer context, safer metric-aligned answer formatting, optional warm-start from the strong Tinker adapter, balanced SFT, and optional GRPO on a curated subset.
+        > Variant: {variant["title"]}. {variant["note"]}
+        """,
+    )
+
+    set_source(
+        1,
+        r"""
+        # ─── GPU preflight + install ONLY what is missing from the Kaggle Docker image ─────────
+        # torch, transformers, peft, triton, bitsandbytes, kagglehub are PRE-INSTALLED
+        # in dockerImageVersionId 31287. DO NOT reinstall them — they contain
+        # Blackwell-specific patches from Kaggle/NVIDIA.
+        import torch
+
+        print(f'preflight torch : {torch.__version__}')
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                'No CUDA GPU detected. In Kaggle Settings, set Accelerator to RTX PRO 6000 '
+                '(or another GPU), then save a new version and rerun.'
+            )
+        print(f'preflight GPU   : {torch.cuda.get_device_name(0)}')
+
+        !pip install -q --no-index \
+            --find-links /kaggle/input/datasets/dennisfong/nvidia-nemotron-offline-packages/offline_packages \
+            datasets trl \
+            --ignore-installed
+
+
+        import datasets, trl
+        print(f'datasets : {datasets.__version__}')   # expect 4.8.4
+        print(f'trl      : {trl.__version__}')         # expect 0.29.1
         """,
     )
 
@@ -61,24 +201,108 @@ def main() -> None:
         print(f'VRAM total   : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
         COMPUTE_DTYPE = torch.bfloat16
 
+        TONG_ADAPTER_MODEL_URL = 'https://www.kaggle.com/models/huikang/nemotron-adapter/Transformers/default/20'
+        TONG_ADAPTER_MODEL_HANDLE = 'huikang/nemotron-adapter/Transformers/default/20'
         WARM_START_ADAPTER_PATH = os.environ.get(
             'NEMOTRON_WARM_START_ADAPTER',
             '/kaggle/input/models/huikang/nemotron-adapter/transformers/default/20',
         )
         if not WARM_START_ADAPTER_PATH or not os.path.exists(WARM_START_ADAPTER_PATH):
             WARM_START_ADAPTER_PATH = None
+        if WARM_START_ADAPTER_PATH is None:
+            try:
+                print('Tong adapter is not mounted under /kaggle/input; downloading via kagglehub ...')
+                WARM_START_ADAPTER_PATH = kagglehub.model_download(TONG_ADAPTER_MODEL_HANDLE)
+                print(f'kagglehub adapter path: {WARM_START_ADAPTER_PATH}')
+            except Exception as kagglehub_exc:
+                print(f'kagglehub model_download failed: {kagglehub_exc!r}')
+                WARM_START_ADAPTER_PATH = None
+        REQUIRE_WARM_START = True
+        if REQUIRE_WARM_START and WARM_START_ADAPTER_PATH is None:
+            raise FileNotFoundError(
+                'Tong warm-start adapter is required. Either attach it in Kaggle editor with '
+                + TONG_ADAPTER_MODEL_URL
+                + ', or allow kagglehub.model_download('
+                + TONG_ADAPTER_MODEL_HANDLE
+                + ') to resolve it, or set NEMOTRON_WARM_START_ADAPTER to the mounted path.'
+            )
 
-        LORA_RANK = 32
-        SFT_MAX_LEN = int(os.environ.get('NEMOTRON_SFT_MAX_LEN', '4096'))
-        SFT_EPOCHS = int(os.environ.get('NEMOTRON_SFT_EPOCHS', '2' if WARM_START_ADAPTER_PATH else '1'))
+        VARIANT_NAME = """
+        + repr(args.variant)
+        + r"""
+        VARIANT_TITLE = """
+        + repr(str(variant["title"]))
+        + r"""
+        VARIANT_NOTE = """
+        + repr(str(variant["note"]))
+        + r"""
+        VARIANT_SMALL_SUBTYPE_OVERRIDES = """
+        + pformat(variant["small_subtype_overrides"], width=100)
+        + r"""
+        VARIANT_TONG_STYLE_OVERRIDES = """
+        + pformat(variant["tong_style_overrides"], width=100)
+        + r"""
+        VARIANT_PRIORITY_DUPLICATION_FACTOR_SMALL = """
+        + repr(int(variant["priority_duplication_factor_small"]))
+        + r"""
+
+        LORA_RANK = 8
+        SFT_MAX_LEN = int(os.environ.get('NEMOTRON_SFT_MAX_LEN', '"""
+        + str(int(variant["sft_max_len"]))
+        + r"""'))
+        SFT_EPOCHS = int(os.environ.get('NEMOTRON_SFT_EPOCHS', '"""
+        + str(int(variant["sft_epochs"]))
+        + r"""'))
         SFT_PER_DEVICE_BATCH = int(os.environ.get('NEMOTRON_SFT_PER_DEVICE_BATCH', '1'))
-        SFT_GRAD_ACCUM = int(os.environ.get('NEMOTRON_SFT_GRAD_ACCUM', '16' if WARM_START_ADAPTER_PATH else '32'))
-        TARGET_SAMPLES_PER_TASK = int(os.environ.get('NEMOTRON_TARGET_SAMPLES_PER_TASK', '1200'))
+        SFT_GRAD_ACCUM = int(os.environ.get('NEMOTRON_SFT_GRAD_ACCUM', '"""
+        + str(int(variant["sft_grad_accum"]))
+        + r"""'))
+        SMALL_SFT_MODE = os.environ.get('NEMOTRON_SMALL_SFT_MODE', '1') == '1'
+        TARGET_SAMPLES_PER_TASK = int(os.environ.get('NEMOTRON_TARGET_SAMPLES_PER_TASK', '128'))
         PREFER_TONG_STYLE_DATA = os.environ.get('NEMOTRON_PREFER_TONG_STYLE_DATA', '1') == '1'
+        SMALL_PROFILE_TASKS = {
+            'numeral',
+            'unit_conversion',
+            'gravity',
+            'cipher',
+            'symbolic_transform',
+            'bit_manipulation',
+            'equation',
+        }
+        SMALL_TASK_LIMITS = {
+            'numeral': 96,
+            'unit_conversion': 128,
+            'gravity': 128,
+            'cipher': 128,
+            'symbolic_transform': 128,
+        }
+        SMALL_SUBTYPE_LIMITS = {
+            ('numeral', 'roman_int'): 96,
+            ('unit_conversion', 'linear_ratio'): 128,
+            ('gravity', 'fall_distance_from_time'): 128,
+            ('cipher', 'monoalphabetic_substitution'): 128,
+            ('symbolic_transform', 'symbol_string_rewrite'): 128,
+            ('bit_manipulation', 'shift'): 48,
+            ('bit_manipulation', 'rotate'): 48,
+            ('bit_manipulation', 'bit_pick_or_negate'): 24,
+            ('bit_manipulation', 'pairwise_parity_family'): 24,
+            ('bit_manipulation', 'pairwise_conjunctive_family'): 48,
+            ('bit_manipulation', 'pairwise_disjunctive_family'): 48,
+            ('bit_manipulation', 'pairwise_parity_conjunctive_mix'): 64,
+            ('equation', 'whole_number_evaluate'): 24,
+            ('equation', 'scalar_reduce'): 24,
+            ('equation', 'digitwise_compose'): 48,
+            ('equation', 'query_filtered_whole_number_evaluate'): 24,
+            ('equation', 'query_filtered_scalar_reduce'): 24,
+            ('equation', 'query_filtered_digitwise_compose'): 24,
+        }
+        SMALL_SUBTYPE_LIMITS.update(VARIANT_SMALL_SUBTYPE_OVERRIDES)
 
         SFT_LR = float(os.environ.get(
             'NEMOTRON_SFT_LR',
-            '5e-5' if WARM_START_ADAPTER_PATH else '2e-4',
+            '"""
+        + str(variant["sft_lr"])
+        + r"""',
         ))
         SFT_MAX_GRAD_NORM = float(os.environ.get('NEMOTRON_SFT_MAX_GRAD_NORM', '1000000000.0'))
 
@@ -90,6 +314,7 @@ def main() -> None:
         GRPO_MAX_COMP_LEN = 256
 
         LOCAL_EVAL_SAMPLES = 48
+        LOCAL_EVAL_MIN_ACCURACY = float(os.environ.get('NEMOTRON_MIN_LOCAL_SANITY', '0.20'))
         VAL_FRACTION = 0.05
         VAL_MIN_SIZE_PER_TASK = 2
 
@@ -105,8 +330,16 @@ def main() -> None:
             'SFT_GRAD_ACCUM': SFT_GRAD_ACCUM,
             'TARGET_SAMPLES_PER_TASK': TARGET_SAMPLES_PER_TASK,
             'WARM_START_ADAPTER_PATH': WARM_START_ADAPTER_PATH,
+            'REQUIRE_WARM_START': REQUIRE_WARM_START,
+            'VARIANT_NAME': VARIANT_NAME,
+            'VARIANT_TITLE': VARIANT_TITLE,
+            'VARIANT_NOTE': VARIANT_NOTE,
+            'SMALL_SFT_MODE': SMALL_SFT_MODE,
+            'SMALL_PROFILE_TASKS': sorted(SMALL_PROFILE_TASKS),
+            'SMALL_SUBTYPE_LIMITS': {str(k): v for k, v in SMALL_SUBTYPE_LIMITS.items()},
             'PREFER_TONG_STYLE_DATA': PREFER_TONG_STYLE_DATA,
             'ENABLE_OPTIONAL_GRPO': ENABLE_OPTIONAL_GRPO,
+            'LOCAL_EVAL_MIN_ACCURACY': LOCAL_EVAL_MIN_ACCURACY,
         })
         """,
     )
@@ -157,34 +390,19 @@ def main() -> None:
         """
         ## 6. Adapter Strategy
 
-        > Preferred path: continue training from the strong public Tinker adapter if it is available. Fallback path: attach a fresh LoRA with broader module coverage than the original notebook.
+        > Required path: continue training from Tong's public Tinker adapter. This notebook does not fall back to a fresh LoRA, because the current route is adapter continuation rather than cold-start fine-tuning.
         """,
     )
 
     set_source(
         13,
         r"""
-        if WARM_START_ADAPTER_PATH:
-            print(f'Warm-starting from adapter: {WARM_START_ADAPTER_PATH}')
-            model = PeftModel.from_pretrained(
-                model,
-                WARM_START_ADAPTER_PATH,
-                is_trainable=True,
-            )
-        else:
-            print('No warm-start adapter found. Attaching a fresh LoRA.')
-            lora_config = LoraConfig(
-                r=LORA_RANK,
-                lora_alpha=32,
-                target_modules=[
-                    'q_proj', 'k_proj', 'v_proj', 'o_proj',
-                    'in_proj', 'out_proj', 'up_proj', 'down_proj', 'lm_head',
-                ],
-                lora_dropout=0.05,
-                bias='none',
-                task_type=TaskType.CAUSAL_LM,
-            )
-            model = get_peft_model(model, lora_config)
+        print(f'Warm-starting from Tong adapter: {WARM_START_ADAPTER_PATH}')
+        model = PeftModel.from_pretrained(
+            model,
+            WARM_START_ADAPTER_PATH,
+            is_trainable=True,
+        )
 
         model.print_trainable_parameters()
         print('Adapter is ready for continued training')
@@ -194,12 +412,12 @@ def main() -> None:
     set_source(
         14,
         """
-        ## 7. Metric-Aligned Trace Formatting, Balanced SFT Data, and Optional External CoT
+        ## 7. Metric-Aligned Trace Formatting, Small High-Confidence SFT Data, and Optional External CoT
 
         > Key fixes here:
         > 1. Do not force `\\boxed{}` when the gold answer contains `{`, `}`, or `\\`, because the official metric parser truncates those cases.
-        > 2. Balance task types so the model does not overfit the dominant bit-manipulation bucket.
-        > 3. If an external CoT dataset is available, mix it in on top of the balanced gold-answer templated data.
+        > 2. Keep templated SFT on a small solved subset instead of broad full-data balancing.
+        > 3. If an external CoT dataset is available, keep it small and avoid aggressive duplication.
         """,
     )
 
@@ -238,6 +456,252 @@ def main() -> None:
             if not nums:
                 return None
             return nums[-1]
+
+
+        BIT_PAIR_RE = re.compile(r'([01]+)\s*->\s*([01]+)')
+        EQUATION_PAIR_RE = re.compile(r'(\d{2})([^\w\s])(\d{2})\s*=\s*([^\n\r]+)')
+        QUERY_EQUATION_RE = re.compile(
+            r'Now,\s*determine the result for:\s*(\d{2})([^\w\s])(\d{2})',
+            re.IGNORECASE,
+        )
+
+
+        def parse_bit_pairs(prompt: str):
+            return BIT_PAIR_RE.findall(prompt)
+
+
+        def parse_equation_examples(prompt: str):
+            return [
+                (m.group(1), m.group(2), m.group(3), m.group(4).strip())
+                for m in EQUATION_PAIR_RE.finditer(prompt)
+            ]
+
+
+        def extract_query_equation(prompt: str):
+            match = QUERY_EQUATION_RE.search(prompt)
+            if match is None:
+                return None
+            return match.group(1), match.group(2), match.group(3)
+
+
+        def bit_not(bits: str) -> str:
+            return ''.join('1' if ch == '0' else '0' for ch in bits)
+
+
+        def bit_shift_left(bits: str, amount: int) -> str:
+            return bits[amount:] + ('0' * amount)
+
+
+        def bit_shift_right(bits: str, amount: int) -> str:
+            return ('0' * amount) + bits[:-amount]
+
+
+        def bit_rotate_left(bits: str, amount: int) -> str:
+            amount %= len(bits)
+            return bits[amount:] + bits[:amount]
+
+
+        def bit_rotate_right(bits: str, amount: int) -> str:
+            amount %= len(bits)
+            if amount == 0:
+                return bits
+            return bits[-amount:] + bits[:-amount]
+
+
+        def equation_examples_match_whole_number_rule(pairs) -> bool:
+            def all_match(transform):
+                try:
+                    return all(transform(left, right) == output for left, _, right, output in pairs)
+                except Exception:
+                    return False
+
+            return any([
+                all_match(lambda left, right: str(int(left) + int(right))),
+                all_match(lambda left, right: str(int(left) - int(right))),
+                all_match(lambda left, right: str(int(right) - int(left))),
+                all_match(lambda left, right: str(abs(int(left) - int(right)))),
+                all_match(lambda left, right: str(int(left) * int(right))),
+                all_match(lambda left, right: left + right),
+                all_match(lambda left, right: right + left),
+            ])
+
+
+        PAIRWISE_OPERATION_FAMILIES = {
+            'pairwise_parity_family': (lambda a, b: a ^ b,),
+            'pairwise_conjunctive_family': (lambda a, b: a & b,),
+            'pairwise_disjunctive_family': (lambda a, b: a | b,),
+        }
+        PAIRWISE_MIX_SUBTYPE_BY_FAMILIES = {
+            ('pairwise_parity_family', 'pairwise_conjunctive_family'): 'pairwise_parity_conjunctive_mix',
+            ('pairwise_parity_family', 'pairwise_disjunctive_family'): 'pairwise_parity_disjunctive_mix',
+            ('pairwise_conjunctive_family', 'pairwise_disjunctive_family'): 'pairwise_conjunctive_disjunctive_mix',
+            (
+                'pairwise_parity_family',
+                'pairwise_conjunctive_family',
+                'pairwise_disjunctive_family',
+            ): 'pairwise_three_family_mix',
+        }
+
+
+        def pairwise_family_matches_target(inputs, target, width, operations) -> bool:
+            for operation in operations:
+                for left_index in range(width):
+                    for right_index in range(width):
+                        for negate_left in (False, True):
+                            for negate_right in (False, True):
+                                values = []
+                                for row in inputs:
+                                    left_value = 1 - row[left_index] if negate_left else row[left_index]
+                                    right_value = 1 - row[right_index] if negate_right else row[right_index]
+                                    values.append(operation(left_value, right_value))
+                                if values == target:
+                                    return True
+            return False
+
+
+        def infer_pairwise_family_cover(pairs):
+            if not pairs:
+                return None
+            widths = {len(bits) for pair in pairs for bits in pair}
+            if len(widths) != 1:
+                return None
+            width = widths.pop()
+            inputs = [[int(ch) for ch in left] for left, _ in pairs]
+            outputs = [[int(ch) for ch in right] for _, right in pairs]
+            allowed_families_per_position = []
+
+            for position in range(width):
+                target = [row[position] for row in outputs]
+                allowed = {
+                    family_name
+                    for family_name, operations in PAIRWISE_OPERATION_FAMILIES.items()
+                    if pairwise_family_matches_target(inputs, target, width, operations)
+                }
+                if not allowed:
+                    return None
+                allowed_families_per_position.append(allowed)
+
+            family_names = tuple(PAIRWISE_OPERATION_FAMILIES)
+            for cover_size in range(1, len(family_names) + 1):
+                for family_cover in __import__('itertools').combinations(family_names, cover_size):
+                    family_cover_set = set(family_cover)
+                    if all(set(allowed) & family_cover_set for allowed in allowed_families_per_position):
+                        return family_cover
+            return None
+
+
+        def classify_bit_small_profile_subtype(prompt: str) -> str:
+            pairs = parse_bit_pairs(prompt)
+            if not pairs:
+                return 'hybrid_boolean_program'
+
+            lengths = {len(bits) for pair in pairs for bits in pair}
+            if len(lengths) != 1:
+                return 'pad_truncate'
+
+            width = lengths.pop()
+            if all(bit_not(left) == right for left, right in pairs):
+                return 'NOT'
+
+            for amount in range(1, width):
+                if all(bit_shift_left(left, amount) == right for left, right in pairs):
+                    return 'shift'
+                if all(bit_shift_right(left, amount) == right for left, right in pairs):
+                    return 'shift'
+                if all(bit_rotate_left(left, amount) == right for left, right in pairs):
+                    return 'rotate'
+                if all(bit_rotate_right(left, amount) == right for left, right in pairs):
+                    return 'rotate'
+
+            inputs = [[int(ch) for ch in left] for left, _ in pairs]
+            outputs = [[int(ch) for ch in right] for _, right in pairs]
+            bit_pick_ok = True
+            for position in range(width):
+                target = [row[position] for row in outputs]
+                matched = False
+                for source_index in range(width):
+                    values = [row[source_index] for row in inputs]
+                    if values == target or [1 - value for value in values] == target:
+                        matched = True
+                        break
+                if not matched:
+                    bit_pick_ok = False
+                    break
+            if bit_pick_ok:
+                return 'bit_pick_or_negate'
+
+            family_cover = infer_pairwise_family_cover(pairs)
+            if family_cover is None:
+                return 'hybrid_boolean_program'
+            if len(family_cover) == 1:
+                return family_cover[0]
+            return PAIRWISE_MIX_SUBTYPE_BY_FAMILIES.get(family_cover, 'pairwise_mixed_family')
+
+
+        def classify_equation_pairs(pairs, allow_multi_operator: bool = True) -> str:
+            if len(pairs) < 2:
+                return 'single_operator_hidden_numeric'
+            outputs = [output for _, _, _, output in pairs]
+            operators = {operator for _, operator, _, _ in pairs}
+            if any(output.startswith('-') for output in outputs):
+                return 'signed_result_rule'
+            if any(output.startswith('0') and len(output) > 1 for output in outputs):
+                return 'leading_zero_rule'
+            if any(not re.fullmatch(r'-?\d+', output) for output in outputs):
+                return 'literal_symbol_rule'
+            if equation_examples_match_whole_number_rule(pairs):
+                return 'whole_number_evaluate'
+            lengths = {len(output.lstrip('-')) for output in outputs}
+            if max(lengths) <= 2:
+                return 'scalar_reduce'
+            if min(lengths) >= 3:
+                return 'digitwise_compose'
+            if allow_multi_operator and len(operators) > 1:
+                return 'multi_operator_examples'
+            return 'single_operator_hidden_numeric'
+
+
+        def classify_equation_small_profile_subtype(prompt: str) -> str:
+            pairs = parse_equation_examples(prompt)
+            if len(pairs) < 2:
+                return 'single_operator_hidden_numeric'
+
+            operators = {operator for _, operator, _, _ in pairs}
+            query_equation = extract_query_equation(prompt)
+            if len(operators) > 1 and query_equation is not None:
+                _, query_operator, _ = query_equation
+                filtered_pairs = [pair for pair in pairs if pair[1] == query_operator]
+                if len(filtered_pairs) >= 2:
+                    filtered_subtype = classify_equation_pairs(filtered_pairs, allow_multi_operator=False)
+                    query_filtered_map = {
+                        'whole_number_evaluate': 'query_filtered_whole_number_evaluate',
+                        'scalar_reduce': 'query_filtered_scalar_reduce',
+                        'digitwise_compose': 'query_filtered_digitwise_compose',
+                    }
+                    if filtered_subtype in query_filtered_map:
+                        return query_filtered_map[filtered_subtype]
+
+            return classify_equation_pairs(pairs, allow_multi_operator=True)
+
+
+        def infer_small_profile_subtype(example: dict) -> str | None:
+            task = example.get('task_type', 'other')
+            prompt = example['prompt']
+            if task == 'numeral':
+                return 'roman_int'
+            if task == 'unit_conversion':
+                return 'linear_ratio'
+            if task == 'gravity':
+                return 'fall_distance_from_time'
+            if task == 'cipher':
+                return 'monoalphabetic_substitution'
+            if task == 'symbolic_transform':
+                return 'symbol_string_rewrite'
+            if task == 'bit_manipulation':
+                return classify_bit_small_profile_subtype(prompt)
+            if task == 'equation':
+                return classify_equation_small_profile_subtype(prompt)
+            return None
 
 
         def build_symbolic_transform_trace(example: dict) -> str:
@@ -322,6 +786,75 @@ def main() -> None:
 
         def build_bit_manipulation_trace(example: dict) -> str:
             answer = clean_answer_text(example['answer'])
+            subtype = example.get('task_subtype') or infer_small_profile_subtype(example)
+
+            if subtype == 'shift':
+                return join_trace([
+                    'Step 1: Compare the examples and identify the single shift direction and amount.',
+                    'Step 2: Confirm that dropped bits are replaced by zeros, not wrapped around.',
+                    'Step 3: Apply the same zero-filled shift to the query input.',
+                    f'Step 4: The resulting binary output is {answer}.',
+                    format_final_answer(answer),
+                ])
+
+            if subtype == 'rotate':
+                return join_trace([
+                    'Step 1: Compare the examples and identify the single rotation direction and amount.',
+                    'Step 2: Confirm that bits wrap around at the ends instead of disappearing.',
+                    'Step 3: Rotate the query input with the same wraparound rule.',
+                    f'Step 4: The resulting binary output is {answer}.',
+                    format_final_answer(answer),
+                ])
+
+            if subtype == 'bit_pick_or_negate':
+                return join_trace([
+                    'Step 1: Compare each output position against the input positions directly.',
+                    'Step 2: Notice that every output bit copies or flips one fixed input bit.',
+                    'Step 3: Apply the same position mapping to the query input.',
+                    f'Step 4: The resulting binary output is {answer}.',
+                    format_final_answer(answer),
+                ])
+
+            if subtype == 'pairwise_parity_family':
+                return join_trace([
+                    'Step 1: Read all example binary input-output pairs.',
+                    'Step 2: Compare each output position with XOR-style parity between two source bits.',
+                    'Step 3: Keep the single parity-style local program that fits all examples.',
+                    'Step 4: Apply the same parity rule to the query input.',
+                    f'Step 5: The resulting binary output is {answer}.',
+                    format_final_answer(answer),
+                ])
+
+            if subtype == 'pairwise_conjunctive_family':
+                return join_trace([
+                    'Step 1: Read all example binary input-output pairs.',
+                    'Step 2: Compare each output position with AND-style gating between two source bits.',
+                    'Step 3: Keep the single conjunctive local rule family that fits all examples.',
+                    'Step 4: Apply the same conjunctive rule to the query input.',
+                    f'Step 5: The resulting binary output is {answer}.',
+                    format_final_answer(answer),
+                ])
+
+            if subtype == 'pairwise_disjunctive_family':
+                return join_trace([
+                    'Step 1: Read all example binary input-output pairs.',
+                    'Step 2: Compare each output position with OR-style gating between two source bits.',
+                    'Step 3: Keep the single disjunctive local rule family that fits all examples.',
+                    'Step 4: Apply the same disjunctive rule to the query input.',
+                    f'Step 5: The resulting binary output is {answer}.',
+                    format_final_answer(answer),
+                ])
+
+            if subtype == 'pairwise_parity_conjunctive_mix':
+                return join_trace([
+                    'Step 1: Read all example binary input-output pairs.',
+                    'Step 2: Confirm that every output position still depends on only two source bits.',
+                    'Step 3: Separate the parity-style positions from the conjunctive-style positions.',
+                    'Step 4: Apply the same parity/conjunctive position map to the query input.',
+                    f'Step 5: The resulting binary output is {answer}.',
+                    format_final_answer(answer),
+                ])
+
             return join_trace([
                 'Step 1: Read all example binary input-output pairs.',
                 'Step 2: Compare each output bit with candidate operations on the input bits.',
@@ -334,6 +867,62 @@ def main() -> None:
 
         def build_equation_trace(example: dict) -> str:
             answer = clean_answer_text(example['answer'])
+            subtype = example.get('task_subtype') or infer_small_profile_subtype(example)
+
+            if subtype == 'whole_number_evaluate':
+                return join_trace([
+                    'Step 1: Read the example equations and test direct whole-number operations on the two operands.',
+                    'Step 2: Keep the simplest operation or concatenation rule that fits all examples.',
+                    'Step 3: Apply the same whole-number rule to the query operands.',
+                    f'Step 4: The resulting value is {answer}.',
+                    format_final_answer(answer),
+                ])
+
+            if subtype == 'scalar_reduce':
+                return join_trace([
+                    'Step 1: Read the examples and notice that each equation reduces to one short scalar output.',
+                    'Step 2: Infer the repeated reduction pattern that maps the operands to that scalar.',
+                    'Step 3: Apply the same reduction to the query operands.',
+                    f'Step 4: The resulting value is {answer}.',
+                    format_final_answer(answer),
+                ])
+
+            if subtype == 'digitwise_compose':
+                return join_trace([
+                    'Step 1: Split each two-digit operand into tens and ones digits.',
+                    'Step 2: Infer the repeated digit-level transformation used by the examples.',
+                    'Step 3: Compose the query result by joining the digit-level partial outputs in the same order.',
+                    f'Step 4: The resulting value is {answer}.',
+                    format_final_answer(answer),
+                ])
+
+            if subtype == 'query_filtered_whole_number_evaluate':
+                return join_trace([
+                    'Step 1: Note the query operator and ignore examples with different symbols.',
+                    'Step 2: Test direct whole-number rules on the filtered examples only.',
+                    'Step 3: Apply the same whole-number rule to the query operands.',
+                    f'Step 4: The resulting value is {answer}.',
+                    format_final_answer(answer),
+                ])
+
+            if subtype == 'query_filtered_scalar_reduce':
+                return join_trace([
+                    'Step 1: Note the query operator and ignore examples with different symbols.',
+                    'Step 2: Infer the scalar reduction rule from the filtered examples only.',
+                    'Step 3: Apply the same scalar reduction to the query operands.',
+                    f'Step 4: The resulting value is {answer}.',
+                    format_final_answer(answer),
+                ])
+
+            if subtype == 'query_filtered_digitwise_compose':
+                return join_trace([
+                    'Step 1: Note the query operator and ignore examples with different symbols.',
+                    'Step 2: Split the filtered examples into digit-level pieces.',
+                    'Step 3: Apply the same digitwise composition rule to the query operands.',
+                    f'Step 4: The resulting value is {answer}.',
+                    format_final_answer(answer),
+                ])
+
             return join_trace([
                 'Step 1: Read the example equations carefully.',
                 'Step 2: Check whether the operands or the result are reversed before applying the rule.',
@@ -512,14 +1101,56 @@ def main() -> None:
             )
 
 
+        def build_small_profile_candidates(df: pd.DataFrame):
+            if not SMALL_SFT_MODE:
+                return df.copy()
+
+            df = df[df['task_type'].isin(SMALL_PROFILE_TASKS)].copy()
+            if len(df) == 0:
+                return df
+
+            df['task_subtype'] = [
+                infer_small_profile_subtype({
+                    'prompt': prompt,
+                    'task_type': task_type,
+                })
+                for prompt, task_type in zip(df['prompt'], df['task_type'])
+            ]
+            allowed_pairs = set(SMALL_SUBTYPE_LIMITS)
+            keep_mask = [
+                (task_type, task_subtype) in allowed_pairs
+                for task_type, task_subtype in zip(df['task_type'], df['task_subtype'])
+            ]
+            return df.loc[keep_mask].reset_index(drop=True)
+
+
+        def build_small_high_confidence_subset(df: pd.DataFrame, seed: int = 42):
+            if not SMALL_SFT_MODE:
+                return balance_by_task(
+                    df,
+                    task_col='task_type',
+                    target_per_task=TARGET_SAMPLES_PER_TASK,
+                    seed=seed,
+                )
+
+            df = build_small_profile_candidates(df)
+            chunks = []
+            for (task_type, task_subtype), group in df.groupby(['task_type', 'task_subtype'], dropna=False):
+                limit = SMALL_SUBTYPE_LIMITS.get((task_type, task_subtype), SMALL_TASK_LIMITS.get(task_type, TARGET_SAMPLES_PER_TASK))
+                take = min(limit, len(group))
+                chunks.append(group.sample(n=take, random_state=seed))
+            if not chunks:
+                return df.iloc[:0].copy()
+            return (
+                pd.concat(chunks, ignore_index=True)
+                .sample(frac=1.0, random_state=seed)
+                .reset_index(drop=True)
+            )
+
         train_core = train_df[['prompt', 'answer', 'task_type']].copy()
-        train_part, val_part = stratified_split_by_task(train_core, seed=42)
-        train_balanced = balance_by_task(
-            train_part,
-            task_col='task_type',
-            target_per_task=TARGET_SAMPLES_PER_TASK,
-            seed=42,
-        )
+        templated_core = build_small_profile_candidates(train_core) if SMALL_SFT_MODE else train_core
+        train_part, val_part = stratified_split_by_task(templated_core, seed=42)
+        train_balanced = build_small_high_confidence_subset(train_part, seed=42)
 
         hf_train_sft = Dataset.from_pandas(train_balanced).map(
             format_for_sft,
@@ -585,15 +1216,16 @@ def main() -> None:
             '/kaggle/input/datasets/dgxchen/nemotron-cot-tong/priority/exp026_s011_priority.txt',
         ]
         TONG_STYLE_BASE_SAMPLES = {
-            'numeral_system.csv': 600,
-            'gravity_physics.csv': 1200,
-            'unit_conversion.csv': 1150,
-            'text_decryption.csv': 1492,
-            'bit_manipulation_including_wrong.csv': 1508,
-            'bit_manipulation_synth_including_wrong_v2.csv': 500,
-            'equation_numeric.csv': 535,
-            'cryptarithm.csv': 69,
+            'numeral_system.csv': 96 if SMALL_SFT_MODE else 600,
+            'gravity_physics.csv': 128 if SMALL_SFT_MODE else 1200,
+            'unit_conversion.csv': 128 if SMALL_SFT_MODE else 1150,
+            'text_decryption.csv': 128 if SMALL_SFT_MODE else 1492,
+            'bit_manipulation_including_wrong.csv': 128 if SMALL_SFT_MODE else 1508,
+            'bit_manipulation_synth_including_wrong_v2.csv': 64 if SMALL_SFT_MODE else 500,
+            'equation_numeric.csv': 96 if SMALL_SFT_MODE else 535,
+            'cryptarithm.csv': 0 if SMALL_SFT_MODE else 69,
         }
+        TONG_STYLE_BASE_SAMPLES.update(VARIANT_TONG_STYLE_OVERRIDES)
 
 
         def load_priority_ids(paths: list[str]) -> set[str]:
@@ -636,6 +1268,8 @@ def main() -> None:
                 df = df[df['generated_cot'].notna() & (df['generated_cot'].astype(str).str.len() > 5)].copy()
                 if len(df) == 0:
                     continue
+                if n <= 0:
+                    continue
                 sampled = df.sample(n=min(n, len(df)), random_state=42).reset_index(drop=True)
                 print(f'Tong-style sample {fname}: {len(sampled)}/{n}')
                 for row in sampled.to_dict('records'):
@@ -652,10 +1286,16 @@ def main() -> None:
                 return None
 
             if priority_ids:
-                dup_rows = [dict(row) for row in rows if row['id'] in priority_ids]
-                rows.extend(dup_rows)
-                print(f'Priority duplicated Tong-style rows: {len(dup_rows)}')
-            else:
+                duplication_factor = 1 if not SMALL_SFT_MODE else VARIANT_PRIORITY_DUPLICATION_FACTOR_SMALL
+                if not SMALL_SFT_MODE:
+                    duplication_factor = max(duplication_factor, 2)
+                if duplication_factor > 1:
+                    dup_rows = []
+                    for _ in range(duplication_factor - 1):
+                        dup_rows.extend(dict(row) for row in rows if row['id'] in priority_ids)
+                    rows.extend(dup_rows)
+                    print(f'Priority duplicated Tong-style rows: {len(dup_rows)}')
+            elif not SMALL_SFT_MODE:
                 hard_rows = [
                     dict(row)
                     for row in rows
@@ -718,7 +1358,7 @@ def main() -> None:
                 extra_train = balance_by_task(
                     extra_cot_rows[['prompt', 'answer', 'task_type', 'assistant_text']],
                     task_col='task_type',
-                    target_per_task=min(1200, TARGET_SAMPLES_PER_TASK),
+                    target_per_task=min(128 if SMALL_SFT_MODE else 1200, TARGET_SAMPLES_PER_TASK),
                     seed=7,
                 )
                 hf_extra_sft = Dataset.from_pandas(extra_train).map(
@@ -878,6 +1518,14 @@ def main() -> None:
         print('SFT complete')
 
         local_eval_result = run_local_eval(sft_trainer.model, val_part, max_new_tokens=256)
+        if local_eval_result is not None and len(local_eval_result):
+            local_eval_accuracy = float(local_eval_result['correct'].mean())
+            print(f'Local sanity threshold: {LOCAL_EVAL_MIN_ACCURACY:.4f}')
+            if local_eval_accuracy < LOCAL_EVAL_MIN_ACCURACY:
+                raise RuntimeError(
+                    f'Local sanity accuracy {local_eval_accuracy:.4f} is below the threshold '
+                    f'{LOCAL_EVAL_MIN_ACCURACY:.4f}. Aborting packaging to avoid a bad submission.'
+                )
         final_model = sft_trainer.model
         """,
     )
@@ -1095,10 +1743,22 @@ def main() -> None:
         """,
     )
 
+    nb.setdefault("metadata", {})
+    nb["metadata"].setdefault("kaggle", {})
+    nb["metadata"]["kaggle"]["accelerator"] = "nvidiaRtxPro6000"
+    nb["metadata"]["kaggle"]["isGpuEnabled"] = True
+    nb["metadata"]["kaggle"]["isInternetEnabled"] = False
+
     nb["metadata"].setdefault("codex_note", {})
     nb["metadata"]["codex_note"]["generated_from"] = str(src)
     nb["metadata"]["codex_note"]["strategy"] = (
-        "Warm-start Tinker adapter + Tong-style priority-weighted CoT mix + metric-safe SFT + optional targeted GRPO"
+        "Tong adapter continuation + small solved-subset SFT variants + metric-safe answer formatting"
+    )
+    nb["metadata"]["codex_note"]["variant"] = args.variant
+    nb["metadata"]["codex_note"]["variant_title"] = str(variant["title"])
+    nb["metadata"]["codex_note"]["variant_note"] = str(variant["note"])
+    nb["metadata"]["codex_note"]["required_model_input"] = (
+        "https://www.kaggle.com/models/huikang/nemotron-adapter/Transformers/default/20"
     )
 
     dst.write_text(json.dumps(nb, ensure_ascii=False, indent=1), encoding="utf-8")
